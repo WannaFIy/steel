@@ -33,7 +33,7 @@ import soundfile as sf
 
 REPO = "espnet/yodas3"
 AUDIO_EXT = {".wav", ".flac", ".mp3", ".opus", ".ogg", ".m4a", ".aac", ".webm", ".mka"}
-META_HINT = re.compile(r"chan|band|stereo|sample_?rate|\bsr\b|codec", re.I)
+META_HINT = re.compile(r"chan|band|stereo|sample_?rate|\bsr\b|codec|freq", re.I)
 
 
 # --------------------------------------------------------------------------- HF
@@ -147,11 +147,46 @@ def index_metadata(rows):
 class CappedReader(io.RawIOBase):
     """File-like over an HTTP response that stops after max_bytes."""
 
-    def __init__(self, resp, max_bytes):
-        self.it = resp.iter_content(1 << 20)
+    def __init__(self, url, headers, max_bytes, retries=8):
+        self.url, self.headers, self.retries = url, headers, retries
         self.buf = b""
         self.read_total = 0
         self.max = max_bytes
+        self.resp = None
+        self._open()
+
+    def _open(self):
+        import requests
+
+        if self.resp is not None:
+            self.resp.close()
+        h = dict(self.headers)
+        if self.read_total:
+            h["Range"] = f"bytes={self.read_total}-"
+        self.resp = requests.get(self.url, stream=True, headers=h, timeout=60)
+        self.resp.raise_for_status()
+        if self.read_total and self.resp.status_code != 206:
+            raise IOError("server ignored Range header; cannot resume")
+        self.it = self.resp.iter_content(1 << 20)
+
+    def _next(self):
+        import time
+
+        for attempt in range(self.retries):
+            try:
+                return next(self.it)
+            except StopIteration:
+                raise
+            except Exception as e:  # connection cut by a proxy/CDN: resume from where we are
+                print(f"   (connection dropped at {self.read_total / 1e6:.0f} MB: {type(e).__name__}; resuming)")
+                time.sleep(2 ** attempt)
+                self._open()
+        return next(self.it)
+
+    def close(self):
+        if self.resp is not None:
+            self.resp.close()
+        super().close()
 
     def readable(self):
         return True
@@ -161,7 +196,7 @@ class CappedReader(io.RawIOBase):
             if self.read_total >= self.max:
                 return 0
             try:
-                self.buf = next(self.it)
+                self.buf = self._next()
             except StopIteration:
                 return 0
             self.read_total += len(self.buf)
@@ -175,14 +210,10 @@ def stream_tar_members(src, outdir, max_files, max_bytes):
     """Yield (stem, audio_path, sidecar_meta) from a tar (URL or local path), streaming."""
     os.makedirs(outdir, exist_ok=True)
     if src.startswith("http"):
-        import requests
         from huggingface_hub.utils import build_hf_headers
 
-        resp = requests.get(src, stream=True, headers=build_hf_headers(), timeout=60)
-        resp.raise_for_status()
-        fobj = io.BufferedReader(CappedReader(resp, max_bytes), buffer_size=1 << 20)
+        fobj = io.BufferedReader(CappedReader(src, build_hf_headers(), max_bytes), buffer_size=1 << 20)
     else:
-        resp = None
         fobj = open(src, "rb")
     sidecars = {}
     n = 0
@@ -212,8 +243,6 @@ def stream_tar_members(src, outdir, max_files, max_bytes):
     except (tarfile.ReadError, EOFError) as e:
         print(f"   (stream ended: {e})")
     finally:
-        if resp is not None:
-            resp.close()
         fobj.close()
 
 
@@ -234,46 +263,87 @@ def probe(path):
                 duration=float(fm.get("duration") or 0))
 
 
-def decode(path, sr, ch):
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", str(ch),
-                          "-ar", str(sr), "-"], capture_output=True, check=True).stdout
+def decode(path, sr, ch, t0=None, dur=None):
+    cmd = ["ffmpeg", "-v", "error"]
+    if t0 is not None:
+        cmd += ["-ss", f"{t0:.3f}"]
+    if dur is not None:
+        cmd += ["-t", f"{dur}"]
+    raw = subprocess.run(cmd + ["-i", path, "-f", "f32le", "-ac", str(ch), "-ar", str(sr), "-"],
+                         capture_output=True, check=True).stdout
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
+
+
+def decode_chunks(path, sr, ch, seconds=60):
+    """Stream-decode a (possibly hours-long) file in fixed-size chunks."""
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", str(ch), "-ar", str(sr), "-"],
+                         stdout=subprocess.PIPE)
+    step = sr * ch * 4 * seconds
+    try:
+        while True:
+            raw = p.stdout.read(step)
+            if not raw:
+                break
+            raw = raw[: len(raw) - len(raw) % (ch * 4)]
+            yield np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
+    finally:
+        p.stdout.close()
+        p.wait()
 
 
 def db(x):
     return 10 * np.log10(max(x, 1e-20))
 
 
-def stereo_stats(x, sr, speech_segs=None):
-    L = x[:, 0].astype(np.float64)
-    R = x[:, 1].astype(np.float64)
-    mid, side = (L + R) / 2, (L - R) / 2
-    em, es = np.mean(mid ** 2), np.mean(side ** 2)
-    corr = float(np.corrcoef(L, R)[0, 1]) if L.std() > 0 and R.std() > 0 else 1.0
-    st = dict(corr=corr, side_mid_db=db(es) - db(em), lr_bal_db=db(np.mean(L ** 2)) - db(np.mean(R ** 2)))
+def stereo_stats(path, sr, ch, duration, speech_segs=None):
+    """Whole-file L/R stats computed in chunks; lag and band split from a 30 s excerpt."""
+    acc = dict(n=0, l=0.0, r=0.0, ll=0.0, rr=0.0, lr=0.0, mm=0.0, ss=0.0)
+    sp = dict(mm=0.0, ss=0.0, n=0)
+    ns = dict(mm=0.0, ss=0.0, n=0)
+    pos = 0
+    for x in decode_chunks(path, sr, ch):
+        L = x[:, 0].astype(np.float64)
+        R = x[:, 1].astype(np.float64)
+        mid, side = (L + R) / 2, (L - R) / 2
+        acc["n"] += len(L)
+        acc["l"] += L.sum(); acc["r"] += R.sum()
+        acc["ll"] += L @ L; acc["rr"] += R @ R; acc["lr"] += L @ R
+        acc["mm"] += mid @ mid; acc["ss"] += side @ side
+        if speech_segs:
+            mask = np.zeros(len(L), bool)
+            t_a, t_b = pos / sr, (pos + len(L)) / sr
+            for s0, s1 in speech_segs:
+                if s1 > t_a and s0 < t_b:
+                    mask[max(0, int((s0 - t_a) * sr)): max(0, int((s1 - t_a) * sr))] = True
+            for d, m in ((sp, mask), (ns, ~mask)):
+                d["mm"] += mid[m] @ mid[m]; d["ss"] += side[m] @ side[m]; d["n"] += int(m.sum())
+        pos += len(L)
+    n = acc["n"]
+    cov = acc["lr"] / n - acc["l"] / n * acc["r"] / n
+    vl = acc["ll"] / n - (acc["l"] / n) ** 2
+    vr = acc["rr"] / n - (acc["r"] / n) ** 2
+    corr = float(cov / np.sqrt(vl * vr)) if vl > 0 and vr > 0 else 1.0
+    st = dict(corr=corr, side_mid_db=db(acc["ss"]) - db(acc["mm"]), lr_bal_db=db(acc["ll"]) - db(acc["rr"]))
+    for key, d in (("speech", sp), ("nonspeech", ns)):
+        if d["n"] > sr:
+            st[f"side_mid_{key}_db"] = db(d["ss"]) - db(d["mm"])
 
-    # Inter-channel lag (spatially placed/delayed sources show a non-zero peak lag).
-    seg = slice(0, min(len(L), sr * 30))
-    a, b = L[seg] - L[seg].mean(), R[seg] - R[seg].mean()
+    # 30 s excerpt from inside the busiest speech stretch (or the middle) for lag + bands.
+    t0 = pick_window(duration, speech_segs and [(a, b, "") for a, b in speech_segs], 30.0)[0] if duration > 30 else 0.0
+    x = decode(path, sr, ch, t0, 30)
+    L, R = x[:, 0].astype(np.float64), x[:, 1].astype(np.float64)
+    mid, side = (L + R) / 2, (L - R) / 2
+    a, b = L - L.mean(), R - R.mean()
     maxlag = int(sr * 0.002)
     if len(a) > 2 * maxlag and a.std() > 0 and b.std() > 0:
-        n = 1 << int(np.ceil(np.log2(len(a) * 2)))
-        cc = np.fft.irfft(np.fft.rfft(a, n) * np.conj(np.fft.rfft(b, n)), n)
+        nfft = 1 << int(np.ceil(np.log2(len(a) * 2)))
+        cc = np.fft.irfft(np.fft.rfft(a, nfft) * np.conj(np.fft.rfft(b, nfft)), nfft)
         cc = np.concatenate([cc[-maxlag:], cc[: maxlag + 1]])
         st["lag_ms"] = (int(np.argmax(cc)) - maxlag) / sr * 1000
     else:
         st["lag_ms"] = 0.0
-
-    # Side/mid inside vs outside transcript speech, and low vs high band side share.
-    if speech_segs:
-        mask = np.zeros(len(L), bool)
-        for s0, s1 in speech_segs:
-            mask[int(s0 * sr): int(s1 * sr)] = True
-        if 0 < mask.sum() < len(L):
-            st["side_mid_speech_db"] = db(np.mean(side[mask] ** 2)) - db(np.mean(mid[mask] ** 2))
-            st["side_mid_nonspeech_db"] = db(np.mean(side[~mask] ** 2)) - db(np.mean(mid[~mask] ** 2))
-    S, M = np.abs(np.fft.rfft(side[seg])) ** 2, np.abs(np.fft.rfft(mid[seg])) ** 2
-    f = np.fft.rfftfreq(len(side[seg]), 1 / sr)
+    S, M = np.abs(np.fft.rfft(side)) ** 2, np.abs(np.fft.rfft(mid)) ** 2
+    f = np.fft.rfftfreq(len(side), 1 / sr)
     for name, lo, hi in (("lo", 0, 300), ("voice", 300, 3400), ("hi", 3400, sr / 2)):
         band = (f >= lo) & (f < hi)
         st[f"side_mid_{name}_db"] = db(S[band].sum()) - db(M[band].sum()) if band.any() else None
@@ -293,10 +363,10 @@ def label(ch, st):
 # ------------------------------------------------------------ transcript timing
 
 SEG_KEYS = [("start", "end"), ("begin", "end"), ("start_time", "end_time"), ("offset", "duration"),
-            ("s", "e")]
+            ("start", "duration"), ("s", "e")]
 
 
-def speech_segments(meta):
+def speech_segments(meta, length_s=None):
     """Find [(start_s, end_s, text)] in whatever shape the metadata uses."""
     out = []
 
@@ -306,7 +376,7 @@ def speech_segments(meta):
                 if a in v and b in v:
                     try:
                         s0, s1 = float(v[a]), float(v[b])
-                        if a == "offset":
+                        if b == "duration":
                             s1 = s0 + s1
                         if s1 > s0:
                             txt = v.get("text") or v.get("transcript") or ""
@@ -316,7 +386,7 @@ def speech_segments(meta):
                         pass
             for x in v.values():
                 walk(x)
-        elif isinstance(v, (list, tuple)) or (hasattr(v, "tolist") and not isinstance(v, (str, bytes))):
+        elif isinstance(v, (list, tuple, np.ndarray)):
             for x in list(v):
                 walk(x)
         elif isinstance(v, str) and v[:1] in "[{":
@@ -332,10 +402,18 @@ def speech_segments(meta):
             if isinstance(v, str) and "<|" in v:
                 for m in re.finditer(r"<\|(\d+\.?\d*)\|>([^<]*)<\|(\d+\.?\d*)\|>", v):
                     out.append((float(m.group(1)), float(m.group(3)), m.group(2).strip()))
+    # Timestamps in milliseconds (e.g. {"start":12100,"duration":2500}) -> seconds.
+    if out:
+        last = max(e for _, e, _ in out)
+        if (length_s and last > 1.5 * length_s) or (not length_s and last > 36000):
+            out = [(a / 1000, b / 1000, t) for a, b, t in out]
     return sorted(out)
 
 
 def transcript_text(meta):
+    segs = speech_segments(meta)
+    if segs:
+        return " ".join(t for _, _, t in segs)
     for k in ("transcript", "text", "sentence", "caption"):
         v = (meta or {}).get(k)
         if isinstance(v, str) and v.strip():
@@ -344,9 +422,8 @@ def transcript_text(meta):
     return " ".join(t for _, _, t in segs)
 
 
-def pick_window(x, sr, segs, dur=20.0):
+def pick_window(total, segs, dur=20.0, path=None):
     """Start time of a dur-second window with the most transcript speech (fallback: energy)."""
-    total = len(x) / sr
     if total <= dur:
         return 0.0, "whole file"
     if segs:
@@ -357,8 +434,10 @@ def pick_window(x, sr, segs, dur=20.0):
             if cover > best:
                 best, best_t = cover, t
         return best_t, f"transcript ({best:.1f}s speech)"
-    mid = x.mean(1)
-    hop = sr
+    if path is None:
+        return max(0.0, total / 2 - dur / 2), "middle of file"
+    mid = decode(path, 8000, 1)[:, 0]
+    hop = 8000
     rms = np.array([np.sqrt(np.mean(mid[i: i + hop] ** 2)) for i in range(0, len(mid) - hop, hop)])
     w = int(dur)
     thr = np.percentile(rms, 30)
@@ -385,13 +464,13 @@ def save_clip(src, t0, dur, out_stereo, out_side):
 
 
 def print_table(results):
-    hdr = f"{'lang':4} {'file':28} {'ch':>2} {'sr':>6} {'codec':6} {'kbps':>5} {'corr':>7} {'S/M dB':>7} {'lag ms':>6} {'meta ch/bw':14} label"
+    hdr = f"{'lang':4} {'file':28} {'ch':>2} {'sr':>6} {'codec':6} {'kbps':>5} {'corr':>7} {'S/M dB':>7} {'lag ms':>6} {'meta ch/dist':14} label"
     print("\n" + hdr + "\n" + "-" * len(hdr))
     for r in results:
         print(f"{r['lang']:4} {r['stem'][:28]:28} {r['ch']:>2} {r['sr']:>6} {str(r['codec'])[:6]:6} "
               f"{(r['bitrate'] or 0) // 1000:>5} {r.get('corr', float('nan')):7.4f} "
               f"{r.get('side_mid_db', float('nan')):7.1f} {r.get('lag_ms', 0):6.2f} "
-              f"{str(r['meta_chbw'])[:14]:14} {r['label']}")
+              f"{str((r['meta'] or {}).get('channels', '-')) + '/' + str(r.get('meta_distinct', '-')):14} {r['label']}")
     print()
     for grp in sorted({r["lang"] for r in results}) + ["ALL"]:
         rs = [r for r in results if grp == "ALL" or r["lang"] == grp]
@@ -400,6 +479,13 @@ def print_table(results):
             counts[r["label"]] = counts.get(r["label"], 0) + 1
         s = ", ".join(f"{k}: {v} ({100 * v / len(rs):.0f}%)" for k, v in sorted(counts.items()))
         print(f"   {grp:4} n={len(rs):3d}  {s}")
+    xt = {}
+    for r in results:
+        xt.setdefault(str(r.get("meta_distinct")), {}).setdefault(r["label"], 0)
+        xt[str(r.get("meta_distinct"))][r["label"]] += 1
+    print("\n   metadata n_distinct_channels vs measured label:")
+    for k, v in sorted(xt.items()):
+        print(f"     n_distinct={k:4}  " + ", ".join(f"{lab}: {c}" for lab, c in sorted(v.items())))
 
 
 def choose_examples(results):
@@ -531,11 +617,11 @@ def main():
             p = probe(path)
             r = dict(lang=lang, stem=stem, path=path, meta=meta, meta_chbw=meta_chbw(meta), **p)
             r["meta_bitrate"] = (meta or {}).get("audio_bitrate", "–")
-            segs = speech_segments(meta)
+            segs = speech_segments(meta, p["duration"] or (meta or {}).get("length"))
             r["segs"] = segs
+            r["meta_distinct"] = (meta or {}).get("n_distinct_channels")
             if p["ch"] >= 2:
-                x = decode(path, p["sr"], p["ch"])
-                r.update(stereo_stats(x, p["sr"], [(s0, s1) for s0, s1, _ in segs]))
+                r.update(stereo_stats(path, p["sr"], p["ch"], p["duration"], [(s0, s1) for s0, s1, _ in segs]))
             else:
                 r.update(corr=float("nan"), side_mid_db=float("nan"))
             r["label"] = label(p["ch"], r)
@@ -550,8 +636,7 @@ def main():
     os.makedirs(clipdir, exist_ok=True)
     picks = choose_examples(results)
     for i, (kind, r) in enumerate(picks, 1):
-        x = decode(r["path"], r["sr"], r["ch"])
-        t0, how = pick_window(x, r["sr"], r["segs"])
+        t0, how = pick_window(r["duration"], r["segs"], 20.0, r["path"])
         base = f"{i:02d}_{kind.replace(' ', '-')}_{r['lang']}_{r['stem'][:40]}"
         r["clip"] = f"clips/{base}.flac"
         r["clip_side"] = f"clips/{base}_side.flac"
