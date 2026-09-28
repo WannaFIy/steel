@@ -421,7 +421,13 @@ def speech_segments(meta, length_s=None):
             except Exception:
                 pass
 
-    walk(meta or {})
+    meta = meta or {}
+    # Only the transcript itself; translations (e.g. translation_en) carry the same timestamps.
+    src = {k: v for k, v in meta.items() if k in ("transcript", "utts", "segments", "text")} or meta
+    walk(src)
+    # Drop non-speech captions such as "[Music]", "[Musique]", "(Cançó ...)", "♪".
+    out = [(a, b, t) for a, b, t in out
+           if not re.fullmatch(r"\s*(?:[\[(][^\])]*[\])]\s*|♪+\s*)+", t or "")]
     # Whisper-style "<|1.23|> text <|4.56|>" timestamps in a plain transcript string.
     if not out:
         for v in (meta or {}).values():
@@ -453,6 +459,13 @@ def pick_window(total, segs, dur=20.0, path=None):
     if total <= dur:
         return 0.0, "whole file"
     if segs:
+        merged = []  # captions overlap; merge so coverage is not double-counted
+        for s0, s1, t in sorted(segs):
+            if merged and s0 <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], s1), "")
+            else:
+                merged.append((s0, s1, t))
+        segs = merged
         best, best_t = -1, 0.0
         for s0, _, _ in segs:
             t = min(max(0.0, s0 - 0.5), total - dur)
@@ -543,62 +556,130 @@ def fmt(v, spec=".1f"):
     return "–" if v is None or (isinstance(v, float) and np.isnan(v)) else format(v, spec)
 
 
+def pct(k, n):
+    return f"{100 * k / n:.0f}%" if n else "–"
+
+
 def write_html(path, results, picks):
-    counts = {}
-    for r in results:
-        counts[r["label"]] = counts.get(r["label"], 0) + 1
     n = len(results)
-    summary = " · ".join(f"{k}: {v}/{n} ({100 * v / n:.0f}%)" for k, v in sorted(counts.items()))
+    langs = sorted({r["lang"] for r in results})
+    cnt = lambda rs, f: sum(1 for r in rs if f(r))
+    is_art = lambda r: bool(r.get("artifact"))
+    genuine = lambda r: r["label"] == "true stereo" and not r.get("artifact")
+
+    # Class breakdown per language (rule as specified, then artifacts split out).
+    classes = [("dual-mono", lambda r: r["label"] == "dual-mono"),
+               ("near-mono", lambda r: r["label"] == "near-mono"),
+               ("true stereo, genuine", genuine),
+               ("true stereo, artifact", lambda r: r["label"] == "true stereo" and is_art(r)),
+               ("mono", lambda r: r["label"] == "mono")]
+    groups = [(g, [r for r in results if r["lang"] == g]) for g in langs] + [("all", results)]
+    head = "".join(f"<th class=num>{html.escape(g)} <span class=dim>n={len(rs)}</span></th>" for g, rs in groups)
+    body = ""
+    for name, f in classes:
+        if not any(f(r) for r in results):
+            continue
+        body += f"<tr><th>{html.escape(name)}</th>" + "".join(
+            f"<td class=num>{cnt(rs, f)} <span class=dim>({pct(cnt(rs, f), len(rs))})</span></td>" for _, rs in groups) + "</tr>"
+    rule = cnt(results, lambda r: r["label"] == "true stereo")
+    gen = cnt(results, genuine)
+    meta2 = cnt(results, lambda r: r.get("meta_distinct") == 2)
+    meta2_mono = cnt(results, lambda r: r.get("meta_distinct") == 2 and r["label"] in ("dual-mono", "near-mono"))
+    g = [r for r in results if genuine(r) and r.get("side_mid_speech_db") is not None and r.get("side_mid_nonspeech_db") is not None]
+    wider_out = cnt(g, lambda r: r["side_mid_nonspeech_db"] - r["side_mid_speech_db"] > 5)
+    same = cnt(g, lambda r: abs(r["side_mid_nonspeech_db"] - r["side_mid_speech_db"]) <= 5)
+
+    findings = f"""
+<ul class=findings>
+<li><b>{pct(rule, n)}</b> of these {n} files pass the side/mid &gt; −20 dB rule. {rule - gen} of those are processed mono (one polarity-flipped copy, phase-decorrelated copies), which leaves <b>{pct(gen, n)} genuine stereo</b>.</li>
+<li>The metadata's own <code>n_distinct_channels</code> is 2 for <b>{pct(meta2, n)}</b> of files. That flag only says L and R are not identical: {meta2_mono} of those {meta2} files measure as dual-mono or near-mono here. A “~70% stereo” figure matches this flag, not audible stereo.</li>
+<li>In {wider_out} of {len(g)} genuine stereo files the side signal is at least 5 dB stronger outside captioned speech than during it: the voice is centred and the width comes from music or intros. In {same} files the width is about the same during speech, which fits a stereo bed under the voice, room ambience, or several mics.</li>
+<li>Sample: {n} files, the first 30 from one Catalan shard and the first 30 from one French shard. That is too few, and too clustered by channel, to confirm or reject a dataset-wide percentage.</li>
+</ul>"""
+
     cards = []
     for kind, r in picks:
-        rows = [("Language", r["lang"]), ("File", r["stem"]), ("Codec / bitrate",
-                f"{r['codec']} · {fmt((r['bitrate'] or 0) / 1000, '.0f')} kbps (meta: {r.get('meta_bitrate', '–')})"),
-                ("Native", f"{r['ch']} ch · {r['sr']} Hz"), ("L/R corr", fmt(r["corr"], ".4f")),
-                ("Side/mid", f"{fmt(r['side_mid_db'])} dB"),
-                ("Side/mid speech vs non-speech",
-                 f"{fmt(r.get('side_mid_speech_db'))} / {fmt(r.get('side_mid_nonspeech_db'))} dB"),
-                ("Side/mid <300 Hz · 300–3400 · >3400",
-                 f"{fmt(r.get('side_mid_lo_db'))} · {fmt(r.get('side_mid_voice_db'))} · {fmt(r.get('side_mid_hi_db'))} dB"),
-                ("Inter-channel lag", f"{fmt(r.get('lag_ms'), '.2f')} ms"),
-                ("Envelope corr (30 s)", fmt(r.get("env_corr"), ".3f")),
-                ("Artifact check", r.get("artifact") or "none"),
-                ("Metadata ch/bw", r["meta_chbw"]), ("Clip", f"{r['clip_t0']:.1f}s +20s ({r['clip_how']})"),
-                ("Side boost", f"+{r['side_gain_db']:.1f} dB")]
+        rows = [("Language", r["lang"]),
+                ("Codec · bitrate", f"{r['codec']} · {fmt((r['bitrate'] or 0) / 1000, '.0f')} kbps (metadata {fmt(r.get('meta_bitrate'), '.0f') if isinstance(r.get('meta_bitrate'), (int, float)) else '–'})"),
+                ("Native", f"{r['ch']} ch · {r['sr']} Hz"),
+                ("L/R correlation", fmt(r["corr"], ".4f")),
+                ("Side/mid, whole file", f"{fmt(r['side_mid_db'])} dB"),
+                ("Side/mid, speech · non-speech", f"{fmt(r.get('side_mid_speech_db'))} · {fmt(r.get('side_mid_nonspeech_db'))} dB"),
+                ("Side/mid by band, <300 · 300–3400 · >3400 Hz", f"{fmt(r.get('side_mid_lo_db'))} · {fmt(r.get('side_mid_voice_db'))} · {fmt(r.get('side_mid_hi_db'))} dB"),
+                ("Envelope correlation", fmt(r.get("env_corr"), ".3f")),
+                ("Metadata", r["meta_chbw"]),
+                ("Clip", f"{r['clip_t0']:.1f} s, 20 s long, chosen from {r['clip_how']}"),
+                ("Side clip boost", f"+{r['side_gain_db']:.1f} dB")]
         table = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
+        verdict = r["label"] + (f" by the rule; actually {r['artifact']}" if r.get("artifact") else "")
         cards.append(f"""
-<section class="card"><header><span class="tag t-{kind.split()[0]}">{html.escape(kind)}</span>
-<h2>{html.escape(r['stem'])}</h2><span class="lbl">{html.escape(r['label'])}</span></header>
-<div class="players"><label>Stereo (48 kHz FLAC)<audio controls preload="none" src="{html.escape(r['clip'])}"></audio></label>
-<label>Side only, (L−R)/2, boosted<audio controls preload="none" src="{html.escape(r['clip_side'])}"></audio></label></div>
-<table>{table}</table>
-<p class="tx">{html.escape(r['snippet'])}</p></section>""")
+<section class="card k-{kind.split()[0]}">
+<div class=cardhead><span class=tag>{html.escape(kind)}</span><span class=verdict>{html.escape(verdict)}</span></div>
+<h3>{html.escape(r['stem'])}</h3>
+<div class=players>
+<label for="a-{html.escape(r['stem'])}">Stereo, 48 kHz FLAC<audio id="a-{html.escape(r['stem'])}" controls preload="none" src="{html.escape(r['clip'])}"></audio></label>
+<label for="s-{html.escape(r['stem'])}">Side only, (L−R)/2, boosted<audio id="s-{html.escape(r['stem'])}" controls preload="none" src="{html.escape(r['clip_side'])}"></audio></label>
+</div>
+<blockquote>{html.escape(r['snippet'])}</blockquote>
+<div class=scroll><table class=stats>{table}</table></div>
+</section>""")
+
     allrows = "".join(
-        f"<tr><td>{html.escape(r['lang'])}</td><td>{html.escape(r['stem'])}</td><td>{r['ch']}</td><td>{r['sr']}</td>"
-        f"<td>{fmt(r.get('corr'), '.4f')}</td><td>{fmt(r.get('side_mid_db'))}</td><td>{html.escape(r['label'] + (' · ' + r['artifact'] if r.get('artifact') else ''))}</td></tr>"
-        for r in results)
-    doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>YODAS3 Stereo Check</title>
+        f"<tr><td>{html.escape(r['lang'])}</td><td class=mono>{html.escape(r['stem'][:12])}</td>"
+        f"<td class=num>{fmt(r.get('corr'), '.3f')}</td><td class=num>{fmt(r.get('side_mid_db'))}</td>"
+        f"<td class=num>{r.get('meta_distinct', '–')}</td>"
+        f"<td>{html.escape(r['label'] + (' · ' + r['artifact'] if r.get('artifact') else ''))}</td></tr>"
+        for r in sorted(results, key=lambda r: -(r.get('side_mid_db') or -999)))
+
+    doc = f"""<title>YODAS3 Stereo Check</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-:root{{--bg:#fafaf8;--fg:#1d1d1b;--muted:#6b6b66;--card:#fff;--line:#e4e4df;--st:#1f6feb;--bd:#b7791f;--dm:#6b6b66}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#151514;--fg:#ececea;--muted:#9a9a94;--card:#1f1f1d;--line:#34342f;--st:#58a6ff;--bd:#e3b341;--dm:#9a9a94}}}}
-body{{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px 16px}}
-main{{max-width:900px;margin:auto}} h1{{margin:0 0 4px}} .sub{{color:var(--muted);margin:0 0 24px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 16px}}
-.card header{{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}} h2{{font-size:15px;margin:0;font-family:ui-monospace,monospace;word-break:break-all}}
-.tag{{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid currentColor}} .t-clearly{{color:var(--st)}} .t-borderline{{color:var(--bd)}} .t-dual-mono{{color:var(--dm)}} .t-artifact{{color:#c2410c}}
-.lbl{{color:var(--muted);font-size:13px}} .players{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}}
-.players label{{font-size:13px;color:var(--muted)}} audio{{width:100%;margin-top:4px}}
-table{{border-collapse:collapse;width:100%;font-size:13px}} th,td{{text-align:left;padding:3px 8px 3px 0;border-top:1px solid var(--line);vertical-align:top}}
-th{{color:var(--muted);font-weight:500;width:40%}} .tx{{font-size:13px;color:var(--muted);font-style:italic;margin:10px 0 0}}
-details{{margin-top:24px}} .scroll{{overflow-x:auto}}
-@media (max-width:600px){{.players{{grid-template-columns:1fr}}}}
-</style></head><body><main>
-<h1>YODAS3 stereo spot check</h1>
-<p class="sub">{n} files · {html.escape(summary)}<br>Thresholds: dual-mono = corr&gt;0.999 or side/mid&lt;−40 dB · near-mono = −40…−20 dB · true stereo = side/mid&gt;−20 dB.</p>
-{''.join(cards)}
-<details><summary>All analysed files</summary><div class="scroll"><table>
-<tr><th>lang</th><th>file</th><th>ch</th><th>sr</th><th>corr</th><th>S/M dB</th><th>label</th></tr>{allrows}</table></div></details>
-</main></body></html>"""
+:root{{--bg:#f6f6f2;--surface:#ffffff;--ink:#1c1e1d;--muted:#666b67;--line:#e0e1dc;--stereo:#2361c4;--border:#9a6410;--mono:#6f7470;--artifact:#b0441d;color-scheme:light}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#131514;--surface:#1c1f1e;--ink:#e9ebe8;--muted:#9ba09c;--line:#2f3331;--stereo:#6fa3ff;--border:#e0a84a;--mono:#a4a9a5;--artifact:#f08a62;color-scheme:dark}}}}
+:root[data-theme="dark"]{{--bg:#131514;--surface:#1c1f1e;--ink:#e9ebe8;--muted:#9ba09c;--line:#2f3331;--stereo:#6fa3ff;--border:#e0a84a;--mono:#a4a9a5;--artifact:#f08a62;color-scheme:dark}}
+body{{background:var(--bg);color:var(--ink);font:15px/1.55 "IBM Plex Sans",system-ui,sans-serif;padding-inline:16px;padding-block:32px 48px}}
+main{{max-width:880px;margin:0 auto;display:grid;gap:28px}}
+h1{{font-size:28px;line-height:1.2;margin:0;font-weight:600;text-wrap:balance}}
+h2{{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 10px;font-weight:500}}
+h3{{font:500 13px/1.3 "IBM Plex Mono",ui-monospace,monospace;margin:0;word-break:break-all;color:var(--muted)}}
+.lede{{color:var(--muted);margin:6px 0 0;max-width:65ch}}
+code,.mono{{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.92em}}
+.findings{{margin:0;padding-left:20px;display:grid;gap:8px;max-width:70ch}}
+.num{{text-align:right;font-variant-numeric:tabular-nums;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px}}
+.dim{{color:var(--muted)}}
+table{{border-collapse:collapse;width:100%;font-size:13px}}
+th,td{{text-align:left;padding:5px 10px 5px 0;border-top:1px solid var(--line);vertical-align:top}}
+th{{font-weight:500;color:var(--muted)}}
+.scroll{{overflow-x:auto}}
+.thresholds{{font-size:13px;color:var(--muted);margin:10px 0 0}}
+.cards{{display:grid;gap:14px}}
+.card{{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--k);border-radius:4px;padding:16px;display:grid;gap:10px}}
+.k-clearly{{--k:var(--stereo)}} .k-borderline{{--k:var(--border)}} .k-dual-mono{{--k:var(--mono)}} .k-artifact{{--k:var(--artifact)}}
+.cardhead{{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}}
+.tag{{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--k)}}
+.verdict{{font-size:13px;color:var(--muted)}}
+.players{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.players label{{font-size:12px;color:var(--muted);display:grid;gap:4px}}
+audio{{width:100%}}
+blockquote{{margin:0;font-size:14px;border-left:2px solid var(--line);padding-left:10px;color:var(--ink);max-width:70ch}}
+.stats th{{width:45%}}
+details summary{{cursor:pointer;color:var(--muted);font-size:13px}}
+details summary:focus-visible,audio:focus-visible{{outline:2px solid var(--stereo);outline-offset:2px}}
+@media (max-width:620px){{.players{{grid-template-columns:1fr}} .stats th{{width:auto}}}}
+</style>
+<main>
+<header>
+<h1>How much of YODAS3 is really stereo?</h1>
+<p class=lede>{n} files streamed from <code>espnet/yodas3</code> ({", ".join(langs)}, shard 0001), decoded at native rate, and measured channel by channel. Listen to the stereo clip and its side channel: whatever you hear in the side clip is the only thing that differs between left and right.</p>
+</header>
+<section><h2>Findings</h2>{findings}</section>
+<section><h2>Class breakdown</h2><div class=scroll><table><tr><th></th>{head}</tr>{body}</table></div>
+<p class=thresholds>Rule: dual-mono if corr &gt; 0.999 or side/mid &lt; −40 dB; near-mono if −40 to −20 dB; true stereo if &gt; −20 dB. Artifact: corr &lt; −0.9 (polarity flip), or |corr| &lt; 0.3 with loudness-envelope corr &gt; 0.7 (same audio, phase scrambled).</p></section>
+<section><h2>Examples</h2><div class=cards>{''.join(cards)}</div></section>
+<section><details><summary>All {n} files, sorted by side/mid</summary><div class=scroll><table>
+<tr><th>lang</th><th>id</th><th class=num>corr</th><th class=num>S/M dB</th><th class=num>meta distinct</th><th>label</th></tr>{allrows}</table></div></details></section>
+</main>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
 
