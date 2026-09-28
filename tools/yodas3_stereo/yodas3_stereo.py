@@ -213,8 +213,16 @@ def stream_tar_members(src, outdir, max_files, max_bytes):
         from huggingface_hub.utils import build_hf_headers
 
         fobj = io.BufferedReader(CappedReader(src, build_hf_headers(), max_bytes), buffer_size=1 << 20)
+    elif os.path.isdir(src):
+        fobj = None
     else:
         fobj = open(src, "rb")
+    if os.path.isdir(src):  # re-analyse files already pulled by an earlier run
+        for name in sorted(os.listdir(src))[:max_files]:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in AUDIO_EXT:
+                yield stem, os.path.join(src, name), {}
+        return
     sidecars = {}
     n = 0
     try:
@@ -243,7 +251,8 @@ def stream_tar_members(src, outdir, max_files, max_bytes):
     except (tarfile.ReadError, EOFError) as e:
         print(f"   (stream ended: {e})")
     finally:
-        fobj.close()
+        if fobj is not None:
+            fobj.close()
 
 
 # ---------------------------------------------------------------------- analysis
@@ -342,12 +351,29 @@ def stereo_stats(path, sr, ch, duration, speech_segs=None):
         st["lag_ms"] = (int(np.argmax(cc)) - maxlag) / sr * 1000
     else:
         st["lag_ms"] = 0.0
+    # Loudness-envelope correlation (50 ms frames): high envelope corr with ~0 waveform corr
+    # means the same programme in both channels with scrambled phase, i.e. pseudo-stereo.
+    h = int(sr * 0.05)
+    k = len(L) // h * h
+    if k >= 4 * h:
+        eL = np.log(np.sqrt((L[:k].reshape(-1, h) ** 2).mean(1)) + 1e-9)
+        eR = np.log(np.sqrt((R[:k].reshape(-1, h) ** 2).mean(1)) + 1e-9)
+        st["env_corr"] = float(np.corrcoef(eL, eR)[0, 1]) if eL.std() > 0 and eR.std() > 0 else 1.0
     S, M = np.abs(np.fft.rfft(side)) ** 2, np.abs(np.fft.rfft(mid)) ** 2
     f = np.fft.rfftfreq(len(side), 1 / sr)
     for name, lo, hi in (("lo", 0, 300), ("voice", 300, 3400), ("hi", 3400, sr / 2)):
         band = (f >= lo) & (f < hi)
         st[f"side_mid_{name}_db"] = db(S[band].sum()) - db(M[band].sum()) if band.any() else None
     return st
+
+
+def artifact(st):
+    """Flag 'stereo' that is really a processed mono signal."""
+    if st.get("corr", 0) < -0.9:
+        return "polarity-flipped mono"
+    if abs(st.get("corr", 1)) < 0.3 and st.get("env_corr", 0) > 0.7:
+        return "phase-decorrelated copy (pseudo-stereo)"
+    return ""
 
 
 def label(ch, st):
@@ -470,7 +496,8 @@ def print_table(results):
         print(f"{r['lang']:4} {r['stem'][:28]:28} {r['ch']:>2} {r['sr']:>6} {str(r['codec'])[:6]:6} "
               f"{(r['bitrate'] or 0) // 1000:>5} {r.get('corr', float('nan')):7.4f} "
               f"{r.get('side_mid_db', float('nan')):7.1f} {r.get('lag_ms', 0):6.2f} "
-              f"{str((r['meta'] or {}).get('channels', '-')) + '/' + str(r.get('meta_distinct', '-')):14} {r['label']}")
+              f"{str((r['meta'] or {}).get('channels', '-')) + '/' + str(r.get('meta_distinct', '-')):14} {r['label']}"
+              + (f"  [{r['artifact']}]" if r.get("artifact") else ""))
     print()
     for grp in sorted({r["lang"] for r in results}) + ["ALL"]:
         rs = [r for r in results if grp == "ALL" or r["lang"] == grp]
@@ -479,6 +506,10 @@ def print_table(results):
             counts[r["label"]] = counts.get(r["label"], 0) + 1
         s = ", ".join(f"{k}: {v} ({100 * v / len(rs):.0f}%)" for k, v in sorted(counts.items()))
         print(f"   {grp:4} n={len(rs):3d}  {s}")
+        art = sum(1 for r in rs if r.get("artifact"))
+        if art:
+            ok = sum(1 for r in rs if r["label"] == "true stereo" and not r.get("artifact"))
+            print(f"        of which artifacts: {art}; genuine true stereo: {ok} ({100 * ok / len(rs):.0f}%)")
     xt = {}
     for r in results:
         xt.setdefault(str(r.get("meta_distinct")), {}).setdefault(r["label"], 0)
@@ -489,7 +520,8 @@ def print_table(results):
 
 
 def choose_examples(results):
-    st = sorted([r for r in results if r["label"] == "true stereo"], key=lambda r: -r["side_mid_db"])
+    st = sorted([r for r in results if r["label"] == "true stereo" and not r.get("artifact")],
+                key=lambda r: -r["side_mid_db"])
     picks = [("clearly stereo", r) for r in st[:3]]
     used = {id(r) for _, r in picks}
     border = sorted([r for r in results if r["ch"] == 2 and id(r) not in used],
@@ -499,6 +531,11 @@ def choose_examples(results):
     dm = sorted([r for r in results if r["label"] == "dual-mono" and id(r) not in used],
                 key=lambda r: r["side_mid_db"])
     picks += [("dual-mono", r) for r in dm[:2]]
+    seen = set()
+    for r in results:  # one example of each artifact type that passes the side/mid rule
+        if r.get("artifact") and r["artifact"] not in seen:
+            seen.add(r["artifact"])
+            picks.append(("artifact", r))
     return picks
 
 
@@ -523,6 +560,8 @@ def write_html(path, results, picks):
                 ("Side/mid <300 Hz · 300–3400 · >3400",
                  f"{fmt(r.get('side_mid_lo_db'))} · {fmt(r.get('side_mid_voice_db'))} · {fmt(r.get('side_mid_hi_db'))} dB"),
                 ("Inter-channel lag", f"{fmt(r.get('lag_ms'), '.2f')} ms"),
+                ("Envelope corr (30 s)", fmt(r.get("env_corr"), ".3f")),
+                ("Artifact check", r.get("artifact") or "none"),
                 ("Metadata ch/bw", r["meta_chbw"]), ("Clip", f"{r['clip_t0']:.1f}s +20s ({r['clip_how']})"),
                 ("Side boost", f"+{r['side_gain_db']:.1f} dB")]
         table = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
@@ -535,7 +574,7 @@ def write_html(path, results, picks):
 <p class="tx">{html.escape(r['snippet'])}</p></section>""")
     allrows = "".join(
         f"<tr><td>{html.escape(r['lang'])}</td><td>{html.escape(r['stem'])}</td><td>{r['ch']}</td><td>{r['sr']}</td>"
-        f"<td>{fmt(r.get('corr'), '.4f')}</td><td>{fmt(r.get('side_mid_db'))}</td><td>{html.escape(r['label'])}</td></tr>"
+        f"<td>{fmt(r.get('corr'), '.4f')}</td><td>{fmt(r.get('side_mid_db'))}</td><td>{html.escape(r['label'] + (' · ' + r['artifact'] if r.get('artifact') else ''))}</td></tr>"
         for r in results)
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>YODAS3 Stereo Check</title>
@@ -546,7 +585,7 @@ body{{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;ma
 main{{max-width:900px;margin:auto}} h1{{margin:0 0 4px}} .sub{{color:var(--muted);margin:0 0 24px}}
 .card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 16px}}
 .card header{{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}} h2{{font-size:15px;margin:0;font-family:ui-monospace,monospace;word-break:break-all}}
-.tag{{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid currentColor}} .t-clearly{{color:var(--st)}} .t-borderline{{color:var(--bd)}} .t-dual-mono{{color:var(--dm)}}
+.tag{{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid currentColor}} .t-clearly{{color:var(--st)}} .t-borderline{{color:var(--bd)}} .t-dual-mono{{color:var(--dm)}} .t-artifact{{color:#c2410c}}
 .lbl{{color:var(--muted);font-size:13px}} .players{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}}
 .players label{{font-size:13px;color:var(--muted)}} audio{{width:100%;margin-top:4px}}
 table{{border-collapse:collapse;width:100%;font-size:13px}} th,td{{text-align:left;padding:3px 8px 3px 0;border-top:1px solid var(--line);vertical-align:top}}
@@ -581,6 +620,7 @@ def main():
     ap.add_argument("--shard", default="0001")
     ap.add_argument("--max-files", type=int, default=30)
     ap.add_argument("--max-bytes", type=float, default=1e9)
+    ap.add_argument("--from-raw", action="store_true", help="re-analyse files already in OUT/raw/<lang>")
     ap.add_argument("--local-tar", nargs="*", default=[], help="lang=path.tar (offline testing)")
     ap.add_argument("--local-meta", nargs="*", default=[], help="lang=path (offline testing)")
     a = ap.parse_args()
@@ -610,6 +650,9 @@ def main():
                 report_columns(rows, mp)
                 meta_rows += rows
             src = hf_hub_url(REPO, pick[0], repo_type="dataset")
+            raw_dir = os.path.join(a.out, "raw", lang)
+            if a.from_raw and os.path.isdir(raw_dir):
+                src = raw_dir
             print(f"\n-> streaming {pick[0]} ({fmt_size(pick[1])}), cap {fmt_size(a.max_bytes)} / {a.max_files} files")
         idx = index_metadata(meta_rows)
         for stem, path, sidecars in stream_tar_members(src, os.path.join(a.out, "raw", lang), a.max_files, a.max_bytes):
@@ -625,6 +668,7 @@ def main():
             else:
                 r.update(corr=float("nan"), side_mid_db=float("nan"))
             r["label"] = label(p["ch"], r)
+            r["artifact"] = artifact(r) if r["label"] == "true stereo" else ""
             results.append(r)
             print(f"   {lang} {stem[:40]:40} {p['ch']}ch {p['sr']}Hz S/M={r['side_mid_db']:.1f} dB -> {r['label']}")
 
